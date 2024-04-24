@@ -1,11 +1,15 @@
 use anyhow::{bail, Context, Error, Ok, Result};
 use std::{
     fs::{create_dir_all, remove_file, write, File, OpenOptions},
-    io::{ErrorKind::AlreadyExists, ErrorKind::NotFound, Write},
+    io::{
+        ErrorKind::{AlreadyExists, NotFound},
+        Write,
+    },
     path::Path,
+    process::Command,
 };
 
-use crate::defs;
+use crate::{assets, boot_patch, defs, ksucalls, module, restorecon};
 use std::fs::metadata;
 #[allow(unused_imports)]
 use std::fs::{set_permissions, Permissions};
@@ -16,6 +20,7 @@ use hole_punch::*;
 use std::io::{Read, Seek, SeekFrom};
 
 use jwalk::WalkDir;
+use std::path::PathBuf;
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
 use rustix::{
@@ -108,7 +113,7 @@ pub fn is_safe_mode() -> bool {
     if safemode {
         return true;
     }
-    let safemode = crate::ksu::check_kernel_safemode();
+    let safemode = ksucalls::check_kernel_safemode();
     log::info!("kernel_safemode: {}", safemode);
     safemode
 }
@@ -191,6 +196,50 @@ pub fn get_tmp_path() -> &'static str {
         return defs::TEMP_DIR;
     }
     ""
+}
+
+#[cfg(target_os = "android")]
+fn link_ksud_to_bin() -> Result<()> {
+    let ksu_bin = PathBuf::from(defs::DAEMON_PATH);
+    let ksu_bin_link = PathBuf::from(defs::DAEMON_LINK_PATH);
+    if ksu_bin.exists() && !ksu_bin_link.exists() {
+        std::os::unix::fs::symlink(&ksu_bin, &ksu_bin_link)?;
+    }
+    Ok(())
+}
+
+pub fn install() -> Result<()> {
+    ensure_dir_exists(defs::ADB_DIR)?;
+    std::fs::copy("/proc/self/exe", defs::DAEMON_PATH)?;
+    restorecon::lsetfilecon(defs::DAEMON_PATH, restorecon::ADB_CON)?;
+    // install binary assets
+    assets::ensure_binaries(false).with_context(|| "Failed to extract assets")?;
+
+    #[cfg(target_os = "android")]
+    link_ksud_to_bin()?;
+
+    Ok(())
+}
+
+pub fn uninstall(magiskboot_path: Option<PathBuf>) -> Result<()> {
+    if Path::new(defs::MODULE_DIR).exists() {
+        println!("- Uninstall modules..");
+        module::uninstall_all_modules()?;
+        module::prune_modules()?;
+    }
+    println!("- Removing directories..");
+    std::fs::remove_dir_all(defs::WORKING_DIR)?;
+    std::fs::remove_file(defs::DAEMON_PATH)?;
+    println!("- Restore boot image..");
+    boot_patch::restore(None, magiskboot_path, true)?;
+    println!("- Uninstall KernelSU manager..");
+    Command::new("pm")
+        .args(["uninstall", "me.weishu.kernelsu"])
+        .spawn()?;
+    println!("- Rebooting in 5 seconds..");
+    std::thread::sleep(std::time::Duration::from_secs(5));
+    Command::new("reboot").spawn()?;
+    Ok(())
 }
 
 // TODO: use libxcp to improve the speed if cross's MSRV is 1.70
